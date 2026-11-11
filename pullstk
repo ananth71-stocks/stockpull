@@ -1,0 +1,145 @@
+import datetime
+import io
+import pandas as pd
+import requests
+import yfinance as yf
+
+
+def get_live_nifty50_tickers():
+    """Fetches the latest official Nifty 50 stock symbols directly from the NSE website source."""
+    url = "https://www1.nseindia.com/content/indices/ind_nifty50list.csv"
+
+    # Spoof headers to prevent NSE from blocking the script request
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code == 200:
+            # Read CSV directly from bytes stream
+            df = pd.read_csv(io.BytesIO(response.content))
+            # Clean and return the list of ticker symbols
+            tickers = df["Symbol"].strip().tolist()
+            return tickers
+    except Exception as e:
+        print(
+            f"⚠️ Error fetching live NSE list: {e}. Falling back to default baseline..."
+        )
+
+    # Hardcoded safety fallback in case the NSE server times out
+    return [
+        "RELIANCE",
+        "TCS",
+        "HDFCBANK",
+        "INFY",
+        "ICICIBANK",
+        "ITC",
+        "SBIN",
+        "BHARTIARTL",
+        "LTIM",
+        "LT",
+    ]
+
+
+def scan_indian_reversal(ticker):
+    """Scans an NSE stock for a reversal after hitting a 52-week low."""
+    yf_ticker = f"{ticker.strip()}.NS"
+
+    try:
+        # Fetch 1 year + 3 months of daily data to ensure true 52-week calculation context
+        stock = yf.Ticker(yf_ticker)
+        df = stock.history(period="1y3m")
+
+        if df.empty or len(df) < 250:
+            return None
+
+        # Isolate historical data from the execution window (last 3 trading days)
+        df_52w = df.iloc[:-3]
+        df_recent = df.iloc[-3:]
+
+        # Establish benchmark historical 52-week low
+        low_52w = df_52w["Low"].min()
+
+        # Did the stock hit or breach that low within the last 3 days?
+        hit_low = df_recent["Low"].min() <= low_52w
+
+        if hit_low:
+            latest_day = df.iloc[-1]
+            prev_day = df.iloc[-2]
+
+            close = latest_day["Close"]
+            open_price = latest_day["Open"]
+            high = latest_day["High"]
+            low = latest_day["Low"]
+            volume = latest_day["Volume"]
+
+            # 20-Day institutional volume verification block
+            avg_volume = df["Volume"].iloc[-20:].mean()
+
+            # Reversal Trigger 1: Bullish Engulfing Candlestick
+            is_bullish_engulfing = (
+                prev_day["Close"] < prev_day["Open"]
+                and close > open_price
+                and open_price <= prev_day["Close"]
+                and close >= prev_day["Open"]
+            )
+
+            # Reversal Trigger 2: Closes in top 25% of the daily High-Low span
+            day_range = high - low
+            close_position = (
+                (close - low) / day_range if day_range > 0 else 0
+            )
+            is_strong_close = (
+                close > open_price and close_position > 0.75
+            )
+
+            # Rule: Ensure the reversal volume exceeds the 20-day baseline to filter out retail noise
+            is_volume_valid = volume > (avg_volume * 1.0)
+
+            if (is_bullish_engulfing or is_strong_close) and is_volume_valid:
+                return {
+                    "Ticker": ticker,
+                    "52W Low (₹)": round(low_52w, 2),
+                    "Current Price (₹)": round(close, 2),
+                    "Pattern Type": "Bullish Engulfing"
+                    if is_bullish_engulfing
+                    else "Strong Close Reversal",
+                    "Volume Multiplier": f"{round(volume / avg_volume, 1)}x",
+                }
+
+    except Exception:
+        return None  # Silently skip during massive batch loops
+    return None
+
+
+def main():
+    print("🔄 Connecting to National Stock Exchange (NSE) indices data...")
+    nifty_watchlist = get_live_nifty50_tickers()
+
+    print(
+        f"🔍 Retrieved {len(nifty_watchlist)} active components. Scanning for 52-week low reversals..."
+    )
+    results = []
+
+    for idx, ticker in enumerate(nifty_watchlist, 1):
+        # Optional progress flag for longer batch execution tracking
+        match = scan_indian_reversal(ticker)
+        if match:
+            results.append(match)
+
+    # Render actionable overview table
+    if results:
+        results_df = pd.DataFrame(results)
+        print("\n✅ Valid Indian Stock Reversal Signals Identified:")
+        print("=" * 75)
+        print(results_df.to_string(index=False))
+        print("=" * 75)
+    else:
+        print(
+            "\n🔎 Scan Complete: No Nifty 50 stocks currently match the reversal criteria."
+        )
+
+
+if __name__ == "__main__":
+    main()
